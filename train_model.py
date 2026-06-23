@@ -1,6 +1,6 @@
 """
 ============================================================
- EMO-CHALLENGE 2026 — FINAL BALANCED VERSION (~80-86%)
+ EMO-CHALLENGE 2026 — UPGRADED CLEAN VERSION
 ============================================================
 """
 
@@ -9,79 +9,62 @@ import numpy as np
 import librosa
 import pickle
 import warnings
-
+from feature_extractor import extract_features
 from scipy.stats import kurtosis, skew
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.feature_selection import SelectKBest, f_classif
+
 from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.metrics import accuracy_score, classification_report
 
 warnings.filterwarnings("ignore")
 
 DATASET_PATH = "data"
 
+SR = 22050
+
 
 # ============================================================
-# FEATURE EXTRACTION (SIMPLE + CLEAN)
+# AUGMENTATION (SAFE VERSION)
 # ============================================================
+def augment_audio(y, sr):
+    augmented = []
 
-def extract_features(file_path, sr_target=22050, n_mfcc=20):
+    # noise (low level)
+    noise = y + 0.002 * np.random.randn(len(y))
+    augmented.append(noise)
 
+    # pitch shift (safe range)
+    pitch = librosa.effects.pitch_shift(y=y, sr=sr, n_steps=1)
+    augmented.append(pitch)
+
+    return augmented
+
+
+# =============
+
+# ============================================================
+# LOAD SINGLE FILE
+# ============================================================
+def load_audio(file_path):
     try:
-        y, sr = librosa.load(file_path, sr=sr_target, mono=True)
+        y, sr = librosa.load(file_path, sr=SR, mono=True)
 
-        if len(y) < sr * 0.15:
+        if len(y) < SR * 0.2:
             return None
 
-        y = librosa.util.normalize(y)
+        return y, sr
 
-        # MFCC
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
-
-        features = []
-
-        features.extend(np.mean(mfcc, axis=1))
-        features.extend(np.std(mfcc, axis=1))
-
-        # Spectral features
-        stft = np.abs(librosa.stft(y))
-
-        centroid = librosa.feature.spectral_centroid(S=stft, sr=sr)
-        bandwidth = librosa.feature.spectral_bandwidth(S=stft, sr=sr)
-
-        features.append(np.mean(centroid))
-        features.append(np.std(centroid))
-
-        features.append(np.mean(bandwidth))
-        features.append(np.std(bandwidth))
-
-        # Time domain
-        zcr = librosa.feature.zero_crossing_rate(y)
-        rms = librosa.feature.rms(y=y)
-
-        features.append(np.mean(zcr))
-        features.append(np.std(zcr))
-
-        features.append(np.mean(rms))
-        features.append(np.std(rms))
-
-        # Statistics
-        features.append(float(kurtosis(y)))
-        features.append(float(skew(y)))
-
-        return np.array(features, dtype=np.float32)
-
-    except Exception as e:
-        print(f"[HATA] {file_path}: {e}")
+    except:
         return None
 
 
 # ============================================================
-# LOAD DATASET
+# DATASET LOADING (FIXED LEAKAGE)
 # ============================================================
-
 def load_dataset(dataset_path):
 
     X = []
@@ -104,91 +87,109 @@ def load_dataset(dataset_path):
 
             path = os.path.join(class_path, file)
 
-            feat = extract_features(path)
+            audio = load_audio(path)
+            if audio is None:
+                continue
 
-            if feat is not None:
-                X.append(feat)
+            y_audio, sr = audio
+
+            # original
+            feat = extract_features(y_audio, sr)
+            X.append(feat)
+            y.append(label)
+
+            # augmentation (ONLY TRAIN LATER)
+            for aug in augment_audio(y_audio, sr):
+                feat_aug = extract_features(aug, sr)
+                X.append(feat_aug)
                 y.append(label)
 
     return np.array(X), np.array(y)
 
 
 # ============================================================
-# MAIN
+# MAIN PIPELINE
 # ============================================================
-
 if __name__ == "__main__":
 
-    # LOAD OR COMPUTE
-    if os.path.exists("X_features.npy"):
-        X = np.load("X_features.npy")
-        y_raw = np.load("y_labels.npy")
-    else:
-        X, y_raw = load_dataset(DATASET_PATH)
+    X, y_raw = load_dataset(DATASET_PATH)
 
-        np.save("X_features.npy", X)
-        np.save("y_labels.npy", y_raw)
+    print(f"\n📊 Total samples: {len(X)}")
+    print(f"📐 Feature size: {X.shape[1]}")
 
-    print(f"\n📊 Toplam örnek : {len(X)}")
-    print(f"📐 Feature sayısı : {X.shape[1]}")
-
-    # LABEL ENCODING
+    # LABEL ENCODER
     le = LabelEncoder()
     y = le.fit_transform(y_raw)
 
-    # TRAIN TEST SPLIT
+    # SPLIT (BEFORE SCALING & SELECTION)
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
-        test_size=0.20,
+        test_size=0.2,
         random_state=42,
         stratify=y
     )
 
     # SCALING
     scaler = StandardScaler()
-
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
 
-    # FEATURE SELECTION (MILD)
-    selector = SelectKBest(score_func=f_classif, k=40)
+    # FEATURE SELECTION (more stable k)
+    selector = SelectKBest(f_classif, k=60)
 
     X_train = selector.fit_transform(X_train, y_train)
     X_test = selector.transform(X_test)
 
-    print(f"\n✅ Feature boyutu : {X_train.shape[1]}")
+    print(f"\n✅ Final feature size: {X_train.shape[1]}")
 
-    # ========================================================
-    # MODEL (SIMPLE SVM ONLY)
-    # ========================================================
-
-    print("\n🧠 Model eğitiliyor...\n")
-
-    model = SVC(
-        C=1.0,
-        kernel="rbf",
+    # MODELS
+    svm = SVC(
+        C=15,
         gamma="scale",
+        kernel="rbf",
         probability=True,
-        class_weight=None
+        class_weight="balanced",
+        random_state=42
     )
 
-    model.fit(X_train, y_train)
+    rf = RandomForestClassifier(
+        n_estimators=500,
+        max_depth=18,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1
+    )
 
-    # ========================================================
-    # TEST
-    # ========================================================
+    print("\n🧠 Training models...")
 
-    y_pred = model.predict(X_test)
+    svm.fit(X_train, y_train)
+    rf.fit(X_train, y_train)
+
+    # ENSEMBLE (BALANCED)
+    ensemble = VotingClassifier(
+        estimators=[
+            ("svm", svm),
+            ("rf", rf)
+        ],
+        voting="soft",
+        weights=[3, 3]
+    )
+
+    print("\n🤝 Training ensemble...")
+
+    ensemble.fit(X_train, y_train)
+
+    # PREDICTION
+    y_pred = ensemble.predict(X_test)
 
     acc = accuracy_score(y_test, y_pred)
 
-    print("=" * 60)
-    print(f"🎯 FINAL ACCURACY : {acc:.4f} ({acc*100:.2f}%)")
+    print("\n" + "=" * 60)
+    print(f"🎯 ACCURACY: {acc:.4f} ({acc*100:.2f}%)")
     print("=" * 60)
 
-    print("\n📊 Classification Report:\n")
-
+    print("\n📊 Report:\n")
     print(classification_report(
         y_test,
         y_pred,
@@ -196,18 +197,16 @@ if __name__ == "__main__":
         zero_division=0
     ))
 
-    # ========================================================
     # SAVE MODEL
-    # ========================================================
+    model_package = {
+    "model": ensemble,
+    "scaler": scaler,
+    "selector": selector,
+    "label_encoder": le,
+    "X_test": X_test,
+    "y_test": y_test
+}
+    with open("emotion_model_faz2.pkl", "wb") as f:
+        pickle.dump(model_package, f)
 
-    save_dict = {
-        "model": model,
-        "scaler": scaler,
-        "selector": selector,
-        "label_encoder": le
-    }
-
-    with open("emotion_model_final.pkl", "wb") as f:
-        pickle.dump(save_dict, f)
-
-    print("\n💾 Model kaydedildi: emotion_model_final.pkl")
+    print("\n💾 Model saved: emotion_model_faz2.pkl")
